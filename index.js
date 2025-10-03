@@ -1,37 +1,35 @@
+// index.js
 import express from "express";
 import cors from "cors";
 
-const API_KEY = process.env.BIRDEYE_API_KEY;        // set in Render
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
+const API_KEY = process.env.BIRDEYE_API_KEY;
+const ALLOWED = (process.env.ALLOWED_ORIGINS || "*")
   .split(",")
   .map(s => s.trim());
-
-if (!API_KEY) throw new Error("Missing BIRDEYE_API_KEY");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS (restrict to your Framer domain if you want)
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.includes("*") || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    if (!origin || ALLOWED.includes("*") || ALLOWED.includes(origin)) return cb(null, true);
     return cb(new Error("Blocked by CORS"));
-  }
+  },
 }));
 
-// very small in-memory cache to reduce API calls
 const cache = new Map();
-const get = (k) => {
+const get = k => {
   const v = cache.get(k);
-  if (!v || v.exp < Date.now()) { cache.delete(k); return null; }
+  if (!v || v.exp < Date.now()) return null;
   return v.data;
 };
-const put = (k, data, ttlMs) => cache.set(k, { data, exp: Date.now() + ttlMs });
+const put = (k, data, ttl) => cache.set(k, { data, exp: Date.now() + ttl });
 
-app.get("/birdeye", async (req, res) => {
+const handler = async (req, res, next) => {
   try {
     const { type, address, limit = "100" } = req.query;
     if (!type || !address) return res.status(400).json({ error: "type and address required" });
+    if (!API_KEY) return res.status(500).json({ error: "Missing BIRDEYE_API_KEY" });
 
     let path = "";
     if (type === "token")   path = `/defi/txs/token?chain=solana&address=${address}&limit=${limit}&sort_type=desc`;
@@ -41,14 +39,10 @@ app.get("/birdeye", async (req, res) => {
 
     const key = `be:${path}`;
     const cached = get(key);
-    if (cached) return res.set("Cache-Control", "public, max-age=5").json(cached);
+    if (cached) return res.set("Cache-Control","public, max-age=5").json(cached);
 
     const r = await fetch("https://public-api.birdeye.so" + path, {
-      headers: {
-        accept: "application/json",
-        "x-api-key": API_KEY,
-        "x-chain": "solana",
-      },
+      headers: { accept: "application/json", "x-api-key": API_KEY, "x-chain": "solana" },
     });
 
     const text = await r.text();
@@ -61,9 +55,16 @@ app.get("/birdeye", async (req, res) => {
       return res.send(text);
     }
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    next(e);
   }
+};
+
+app.get("/birdeye", handler);
+app.get("/", handler);
+app.get("/healthz", (_req, res) => res.send("ok"));
+app.use((err, _req, res, _next) => {
+  console.error("proxy error:", err);
+  res.status(500).json({ error: String(err?.message || err) });
 });
 
-app.get("/healthz", (_req, res) => res.send("ok"));
 app.listen(PORT, () => console.log(`Birdeye proxy listening on :${PORT}`));
