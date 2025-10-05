@@ -85,76 +85,94 @@ async function getPrices(addresses) {
 }
 
 // ---------- WALLET ----------
-app.get("/wallet", async (req, res) => {
-  try {
-    const ownerStr = String(req.query.address || "").trim();
-    const minUsd = Number(req.query.minUsd ?? 0);
-    const maxTokens = Number(req.query.maxTokens ?? 25);
-    if (!ownerStr) return res.status(400).json({ error: "Missing address" });
-    const owner = new PublicKey(ownerStr);
+function shortPk(pk) {
+  try { return new PublicKey(pk).toBase58().slice(0,4) + "…" + new PublicKey(pk).toBase58().slice(-4); }
+  catch { return String(pk).slice(0,4) + "…" + String(pk).slice(-4); }
+}
 
+async function safeGetParsed(owner, programId, label) {
+  try {
+    const out = await conn.getParsedTokenAccountsByOwner(owner, { programId });
+    return out.value || [];
+  } catch (e) {
+    console.warn(`[wallet] ${label} token scan failed:`, e?.message || e);
+    return []; // graceful fallback
+  }
+}
+
+app.get("/wallet", async (req, res) => {
+  const ownerStr = String(req.query.address || "").trim();
+  const minUsd = Number(req.query.minUsd ?? 0);
+  const maxTokens = Math.max(1, Number(req.query.maxTokens ?? 25));
+  if (!ownerStr) return res.status(400).json({ error: "Missing address" });
+
+  try {
     const cacheKey = `wallet:${ownerStr}:${minUsd}:${maxTokens}`;
     const cached = getCache(cacheKey, 10000);
     if (cached) return res.json(cached);
 
-    // SOL balance
-    const lamports = await conn.getBalance(owner, "confirmed");
-    const sol = lamports / LAMPORTS_PER_SOL;
+    const owner = new PublicKey(ownerStr);
 
-    // SPL accounts from BOTH programs
-    const [legacy, t22] = await Promise.all([
-      conn.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_LEGACY }),
-      conn.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022 }),
+    // SOL balance always safe
+    let sol = 0;
+    try {
+      const lamports = await conn.getBalance(owner, "confirmed");
+      sol = lamports / LAMPORTS_PER_SOL;
+    } catch (e) {
+      console.warn("[wallet] getBalance failed:", e?.message || e);
+    }
+
+    // Query both token programs, but never crash if one fails
+    const [legacyAccounts, t22Accounts] = await Promise.all([
+      safeGetParsed(owner, TOKEN_LEGACY, "Tokenkeg"),
+      safeGetParsed(owner, TOKEN_2022,  "Token-2022"),
     ]);
-    const accounts = [...legacy.value, ...t22.value];
+    const accounts = [...legacyAccounts, ...t22Accounts];
 
-    let tokens = accounts
-      .map(v => {
-        const info = v.account.data.parsed.info;
-        const mint = info.mint;
-        const ta = info.tokenAmount;
-        const amount = Number(ta.uiAmount || 0);
-        const decimals = Number(ta.decimals || 0);
-        return { mint, amount, decimals };
-      })
-      .filter(t => t.amount > 0);
+    const tokensRaw = accounts.map(v => {
+      const info = v.account.data.parsed.info;
+      const mint = info.mint;
+      const ta = info.tokenAmount;
+      return {
+        mint,
+        amount: Number(ta?.uiAmount || 0),
+        decimals: Number(ta?.decimals || 0),
+      };
+    }).filter(t => t.amount > 0);
 
-    const mints = [...new Set(tokens.map(t => t.mint))];
+    const mints = [...new Set(tokensRaw.map(t => t.mint))];
 
-    // prices (tokens + WSOL for SOL USD)
+    // Prices (tokens + WSOL for SOL USD)
     const priceMap = await getPrices([...mints, WSOL]);
-    const solPrice = priceMap[WSOL] || 0;
+    const solPrice = Number(priceMap[WSOL] || 0);
 
-    tokens = tokens
-      .map(t => {
-        const meta = jupMap.get(t.mint) || {};
-        const priceUsd = Number(priceMap[t.mint] || 0);
-        const usd = priceUsd * t.amount;
-        // fallback logo to Jupiter CDN even if not in list
-        const logo =
-          meta.logoURI ||
-          `https://img.jup.ag/128/${t.mint}.png`;
-        const symbol = meta.symbol || (meta.name ? meta.name.slice(0, 10) : "");
-        return {
-          mint: t.mint,
-          symbol,
-          name: meta.name || "",
-          logo,
-          amount: t.amount,
-          priceUsd,
-          usd,
-          decimals: t.decimals,
-        };
-      })
-      .sort((a, b) => (b.usd || 0) - (a.usd || 0));
+    const tokens = tokensRaw.map(t => {
+      const meta = jupMap.get(t.mint) || {};
+      const priceUsd = Number(priceMap[t.mint] || 0);
+      const usd = priceUsd * t.amount;
+      const logo = meta.logoURI || `https://img.jup.ag/128/${t.mint}.png`;
+      const symbol = meta.symbol || (meta.name ? meta.name.slice(0, 10) : "");
+      return {
+        mint: t.mint,
+        symbol,
+        name: meta.name || "",
+        logo,
+        amount: t.amount,
+        decimals: t.decimals,
+        priceUsd,
+        usd,
+      };
+    })
+    // show highest value first; if price is 0, keep but push down
+    .sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    // show unknown-price tokens too; minUsd only hides priced ones
     const visible = tokens
       .filter(t => (t.priceUsd > 0 ? t.usd >= minUsd : true))
-      .slice(0, Math.max(1, maxTokens));
+      .slice(0, maxTokens);
 
     const payload = {
       owner: ownerStr,
+      ownerShort: shortPk(ownerStr),
       updated: new Date().toISOString(),
       sol,
       solUsd: sol * solPrice,
@@ -163,10 +181,19 @@ app.get("/wallet", async (req, res) => {
     };
 
     setCache(cacheKey, payload);
-    res.json(payload);
+    return res.json(payload);
   } catch (e) {
-    console.error("wallet error", e);
-    res.status(500).json({ error: String(e?.message || e) });
+    console.error("[wallet] fatal handler error:", e);
+    // Always return 200 with a minimal payload to avoid a 502 from the platform
+    return res.status(200).json({
+      owner: ownerStr,
+      updated: new Date().toISOString(),
+      sol: 0,
+      solUsd: 0,
+      totalUsd: 0,
+      tokens: [],
+      warning: String(e?.message || e),
+    });
   }
 });
 
