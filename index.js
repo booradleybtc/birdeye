@@ -1,12 +1,13 @@
 // index.js
 // Solana wallet snapshot + recent buys proxy
-// Works on Node 16–20 (adds fetch polyfill if needed)
+// - Balances via Helius (RPC) or public RPC
+// - Prices via Jupiter with Birdeye fallback
+// - Recent buys via Birdeye (computes USD when missing)
 
 const express = require("express");
 const cors = require("cors");
 const { Connection, PublicKey, LAMPORTS_PER_SOL } = require("@solana/web3.js");
-const { TOKEN_PROGRAM_ID } = require("@solana/spl-token");
-const { TOKEN_2022_PROGRAM_ID } = require("@solana/spl-token-2022");
+const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } = require("@solana/spl-token");
 
 // ---------- ENV ----------
 const PORT = Number(process.env.PORT || 3000);
@@ -17,20 +18,14 @@ const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const RPC_URL = HELIUS_API_KEY
   ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
   : "https://api.mainnet-beta.solana.com";
-
 const conn = new Connection(RPC_URL, "confirmed");
 
 // ---------- CONSTANTS ----------
 const WSOL = "So11111111111111111111111111111111111111112";
 
-// ---------- fetch polyfill (for Node < 18) ----------
-let _fetch = globalThis.fetch;
+// Basic fetch wrapper (Node 18+ has global fetch)
 async function http(url, opt = {}) {
-  if (!_fetch) {
-    const mod = await import("node-fetch");
-    _fetch = mod.default;
-  }
-  const r = await _fetch(url, opt);
+  const r = await fetch(url, opt);
   return r;
 }
 
@@ -130,7 +125,7 @@ app.use((req, res, next) => {
   res.on("finish", () => {
     const ms = Date.now() - req.start;
     console.log(
-      `[${req.method}]${res.statusCode}${req.originalUrl} clientIP="${(req.headers["x-forwarded-for"] || "").split(",")[0] || req.ip}" responseTimeMS=${ms} responseBytes=${res.getHeader("content-length") || 0} userAgent=${JSON.stringify(req.headers["user-agent"] || "")}`
+      `[${req.method}]${res.statusCode} ${req.originalUrl} clientIP="${(req.headers["x-forwarded-for"] || "").split(",")[0] || req.ip}" responseTimeMS=${ms} responseBytes=${res.getHeader("content-length") || 0} userAgent=${JSON.stringify(req.headers["user-agent"] || "")}`
     );
   });
   next();
@@ -151,10 +146,12 @@ app.get("/wallet", async (req, res) => {
     const owner = new PublicKey(ownerStr);
     const jmap = await getJupMap();
 
+    // SOL
     let sol = 0;
     try { sol = (await conn.getBalance(owner, "confirmed")) / LAMPORTS_PER_SOL; }
     catch (e) { console.warn("[wallet] getBalance:", e.message); }
 
+    // Token accounts (legacy + Token-2022)
     const [legacy, t22] = await Promise.all([
       safeGetParsed(owner, TOKEN_PROGRAM_ID, "Tokenkeg"),
       safeGetParsed(owner, TOKEN_2022_PROGRAM_ID, "Token-2022"),
@@ -197,6 +194,7 @@ app.get("/wallet", async (req, res) => {
       })
       .sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
+    // Only filter by minUsd if we actually know the price
     const visible = tokens
       .filter((t) => (t.priceUsd > 0 ? t.usd >= minUsd : true))
       .slice(0, maxTokens);
@@ -248,6 +246,7 @@ app.get("/buys", async (req, res) => {
     const j = await r.json();
     const rows = j?.data?.items || j?.data || j?.items || [];
 
+    // Price any mints we see so we can compute USD
     const toPrice = new Set();
     rows.forEach((tx) => {
       if (tx?.tokenMint) toPrice.add(tx.tokenMint);
@@ -260,8 +259,7 @@ app.get("/buys", async (req, res) => {
     const buys = rows
       .map((tx) => {
         const mint = tx.tokenMint || tx.baseMint || tx.mint || "";
-        const amount =
-          Number(tx?.amount || tx?.tokenAmount || tx?.baseAmount || 0) || 0;
+        const amount = Number(tx?.amount || tx?.tokenAmount || tx?.baseAmount || 0) || 0;
         const px = Number(tx?.priceUsd) || Number(pmap[mint] || 0);
         const usdRaw =
           Number(tx?.valueUsd) || (Number.isFinite(px) && px > 0 ? amount * px : undefined);
