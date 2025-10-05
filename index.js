@@ -12,8 +12,6 @@ if (!BIRDEYE_KEY) throw new Error("Missing BIRDEYE_KEY");
 if (!RPC_URL) throw new Error("Missing RPC_URL");
 
 const app = express();
-
-// CORS + disable caching/etags to avoid 304s in Framer
 app.disable("etag");
 app.use(cors({ origin: "*", maxAge: 0 }));
 app.use((req, res, next) => {
@@ -23,20 +21,20 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- tiny in-memory cache to reduce 429s ---
-const cache = new Map(); // key -> { ts, data }
-const getCache = (key, ttlMs = 10000) => {
-  const hit = cache.get(key);
-  if (hit && Date.now() - hit.ts < ttlMs) return hit.data;
+// tiny TTL cache
+const cache = new Map();
+const getCache = (k, ttl = 10000) => {
+  const v = cache.get(k);
+  if (v && Date.now() - v.ts < ttl) return v.data;
   return null;
 };
-const setCache = (key, data) => cache.set(key, { ts: Date.now(), data });
+const setCache = (k, data) => cache.set(k, { ts: Date.now(), data });
 
-// --- shared helpers ---
 const BE = "https://public-api.birdeye.so";
 const beHeaders = { "X-API-KEY": BIRDEYE_KEY, accept: "application/json" };
+const WSOL = "So11111111111111111111111111111111111111112";
 
-// Load Jupiter token list once (symbols, logos, decimals)
+// Jupiter token list (symbols/logos/decimals)
 let jupMap = new Map();
 async function loadJup() {
   try {
@@ -45,17 +43,46 @@ async function loadJup() {
     jupMap = new Map(list.map(t => [t.address, t]));
     console.log(`Loaded Jupiter list: ${list.length} tokens`);
   } catch (e) {
-    console.error("Failed to load Jupiter token list", e);
+    console.error("Failed to load Jupiter list", e);
   }
 }
 await loadJup();
-// refresh daily
 setInterval(loadJup, 24 * 60 * 60 * 1000);
 
-// --- RPC connection ---
+// RPC
 const conn = new Connection(RPC_URL, "confirmed");
 
-// =============== WALLET SNAPSHOT =================
+// ---- Birdeye price helpers ----
+async function getPrice(address) {
+  try {
+    const u = new URL(`${BE}/defi/price`);
+    u.searchParams.set("address", address);
+    const r = await fetch(u, { headers: beHeaders });
+    if (!r.ok) return 0;
+    const j = await r.json();
+    const d = j.data;
+    if (typeof d === "number") return d;
+    if (d?.value != null) return Number(d.value) || 0;
+    if (d?.price != null) return Number(d.price) || 0;
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function getPrices(addresses) {
+  const uniq = [...new Set(addresses)];
+  const out = {};
+  const BATCH = 6;
+  for (let i = 0; i < uniq.length; i += BATCH) {
+    const chunk = uniq.slice(i, i + BATCH);
+    const vals = await Promise.all(chunk.map(a => getPrice(a)));
+    chunk.forEach((a, idx) => (out[a] = vals[idx] || 0));
+  }
+  return out;
+}
+
+// ================= WALLET =================
 app.get("/wallet", async (req, res) => {
   try {
     const ownerStr = String(req.query.address || "").trim();
@@ -68,16 +95,15 @@ app.get("/wallet", async (req, res) => {
     const cached = getCache(key, 10000);
     if (cached) return res.json(cached);
 
-    // Native SOL
+    // SOL balance
     const lamports = await conn.getBalance(owner, "confirmed");
     const sol = lamports / LAMPORTS_PER_SOL;
 
-    // SPL tokens (parsed)
+    // SPL token accounts
     const { value } = await conn.getParsedTokenAccountsByOwner(owner, {
-      programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+      programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
     });
 
-    // Map accounts -> amounts
     let tokens = value
       .map(v => {
         const info = v.account.data.parsed.info;
@@ -89,52 +115,42 @@ app.get("/wallet", async (req, res) => {
       })
       .filter(t => t.amount > 0);
 
-    // Enrich with Jupiter meta and Birdeye price
     const mints = [...new Set(tokens.map(t => t.mint))];
-    // Fetch prices from Birdeye in batch (graceful if it fails)
-    let prices = {};
-    try {
-      const u = new URL(`${BE}/defi/price`);
-      u.searchParams.set("address", mints.join(","));
-      const pr = await fetch(u, { headers: beHeaders });
-      const pj = await pr.json();
-      // Birdeye returns { data: { [mint]: { value: price } } } or array – normalize:
-      const d = pj.data || {};
-      for (const k of Object.keys(d)) {
-        const val = d[k]?.value ?? d[k]?.price ?? d[k];
-        if (typeof val === "number") prices[k] = val;
-      }
-    } catch (_) {}
 
-    // Compose rows
+    // prices (tokens + WSOL for SOL)
+    const priceMap = await getPrices([...mints, WSOL]);
+    const solPrice = priceMap[WSOL] || 0;
+
     tokens = tokens
       .map(t => {
         const meta = jupMap.get(t.mint) || {};
-        const price = prices[t.mint] ?? 0;
+        const priceUsd = Number(priceMap[t.mint] || 0);
+        const usd = priceUsd * t.amount;
         return {
           mint: t.mint,
           symbol: meta.symbol || "",
           name: meta.name || "",
           logo: meta.logoURI || "",
           amount: t.amount,
-          priceUsd: price,
-          usd: price * t.amount,
-          decimals: t.decimals
+          priceUsd,
+          usd,
+          decimals: t.decimals,
         };
       })
       .sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
-    // Trim + filter by minUsd
-    const visible = tokens.filter(t => (t.usd || 0) >= minUsd).slice(0, maxTokens);
+    // Show tokens even if price unknown; minUsd only hides priced ones
+    const visible = tokens
+      .filter(t => (t.priceUsd > 0 ? t.usd >= minUsd : true))
+      .slice(0, maxTokens);
 
-    const solPrice = prices["So11111111111111111111111111111111111111112"] ?? prices["SOL"] ?? 0;
     const snapshot = {
       owner: ownerStr,
       updated: new Date().toISOString(),
       sol,
       solUsd: sol * solPrice,
       totalUsd: visible.reduce((s, t) => s + (t.usd || 0), sol * solPrice),
-      tokens: visible
+      tokens: visible,
     };
 
     setCache(key, snapshot);
@@ -145,26 +161,25 @@ app.get("/wallet", async (req, res) => {
   }
 });
 
-// =============== RECENT BUYS =====================
-// Accepts ?type=token|pair&address=...&limit=10&minUsd=0
+// ================= BUYS ===================
+// ?type=token|pair&address=...&limit=10&minUsd=0
 app.get("/buys", async (req, res) => {
   try {
-    const type = String(req.query.type || req.query.kind || "token").toLowerCase();
+    let typ = String(req.query.type ?? req.query.kind ?? "token").toLowerCase();
+    if (typ !== "token" && typ !== "pair") typ = "token"; // guard 'undefined'
     const address = String(req.query.address || "").trim();
     const limit = Math.min(Number(req.query.limit ?? 10), 100);
     const minUsd = Number(req.query.minUsd ?? 0);
     if (!address) return res.status(400).json({ error: "Missing address" });
 
-    const key = `buys:${type}:${address}:${limit}:${minUsd}`;
+    const key = `buys:${typ}:${address}:${limit}:${minUsd}`;
     const cached = getCache(key, 10000);
     if (cached) return res.json(cached);
 
-    // Birdeye trades endpoint; supports token or pair address
-    // Docs vary; we try /defi/trades first, then fallback to /defi/txs if needed.
     async function fetchTrades(endpoint) {
       const url = new URL(`${BE}${endpoint}`);
       url.searchParams.set("address", address);
-      url.searchParams.set("limit", String(Math.max(limit, 20))); // fetch extra, we'll filter
+      url.searchParams.set("limit", String(Math.max(limit, 20)));
       const r = await fetch(url, { headers: beHeaders });
       if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
       const j = await r.json();
@@ -175,22 +190,24 @@ app.get("/buys", async (req, res) => {
     try {
       rows = await fetchTrades("/defi/trades");
     } catch {
-      // fallback(s)
       try { rows = await fetchTrades("/defi/txs"); } catch {}
       if (!Array.isArray(rows)) rows = [];
     }
 
-    // Normalize & filter buys (Birdeye names differ across endpoints)
     const items = rows
       .map(x => {
-        // possible shapes:
-        // { side: "buy"|"sell", priceUsd, amountToken, symbol, txHash, dex, ts }
-        // { is_buy: true/false, price, volume_usd, base_mint, quote_mint, tx_hash, market, blockUnixTime }
-        const side = (x.side || (x.is_buy ? "buy" : "sell") || "").toString().toLowerCase();
-        const isBuy = side === "buy" || x.is_buy === true;
-        const usd = Number(x.volume_usd ?? x.usdValue ?? x.value_usd ?? 0);
-        const qty = Number(x.amountToken ?? x.base_amount ?? x.amount ?? 0);
-        const price = Number(x.priceUsd ?? x.price_usd ?? x.price ?? 0);
+        const side = [
+          x.side, x.tradeType, x.type, x.action,
+          (x.is_buy === true ? "buy" : ""), (x.isBuyer === true ? "buy" : "")
+        ]
+          .filter(Boolean)
+          .map(s => String(s).toLowerCase())
+          .join(" ");
+
+        const isBuy = /\bbuy\b/.test(side);
+        const usd = Number(x.volume_usd ?? x.usdValue ?? x.value_usd ?? x.totalUsd ?? 0) || 0;
+        const qty = Number(x.amountToken ?? x.base_amount ?? x.amount ?? x.size ?? 0) || 0;
+        const price = Number(x.priceUsd ?? x.price_usd ?? x.price ?? 0) || 0;
         const when =
           Number(x.ts) ||
           Number(x.blockUnixTime) ||
@@ -200,16 +217,16 @@ app.get("/buys", async (req, res) => {
           usd,
           qty,
           priceUsd: price,
-          symbol: x.symbol || x.base_symbol || "",
-          dex: x.dex || x.market || "",
-          tx: x.txHash || x.tx_hash || "",
-          time: when ? new Date(when).toISOString() : undefined
+          symbol: x.symbol || x.base_symbol || x.baseSymbol || "",
+          dex: x.dex || x.market || x.source || "",
+          tx: x.txHash || x.tx_hash || x.signature || "",
+          time: when ? new Date(when).toISOString() : undefined,
         };
       })
       .filter(i => i.isBuy && i.usd >= minUsd)
       .slice(0, limit);
 
-    const payload = { type, address, items };
+    const payload = { type: typ, address, items };
     setCache(key, payload);
     res.json(payload);
   } catch (e) {
