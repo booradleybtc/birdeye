@@ -1,190 +1,257 @@
-// index.js
-import express from "express";
-import fetch from "node-fetch";
-import cors from "cors";
-import { Connection, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
+// server.js
+// A tiny proxy for wallet snapshots & recent buys on Solana
+// - Balances via Helius (RPC)
+// - Prices via Jupiter (public) with Birdeye fallback if available
+// - Buys via Birdeye, but we compute USD ourselves when Birdeye omits it
 
-const PORT = process.env.PORT || 10000;
-const BIRDEYE_KEY = process.env.BIRDEYE_KEY;
-const RPC_URL = process.env.RPC_URL;
+const express = require("express");
+const cors = require("cors");
+const { Connection, PublicKey, LAMPORTS_PER_SOL } = require("@solana/web3.js");
+const { TOKEN_PROGRAM_ID } = require("@solana/spl-token");
+const { TOKEN_2022_PROGRAM_ID } = require("@solana/spl-token-2022");
 
-if (!BIRDEYE_KEY) throw new Error("Missing BIRDEYE_KEY");
-if (!RPC_URL) throw new Error("Missing RPC_URL");
+// ---------- ENV ----------
+const PORT = Number(process.env.PORT || 3000);
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 
-const app = express();
-app.disable("etag");
-app.use(cors({ origin: "*", maxAge: 0 }));
-app.use((_, res, next) => {
-  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.set("Pragma", "no-cache");
-  res.set("Expires", "0");
-  next();
-});
-
-// tiny TTL cache
-const cache = new Map();
-const getCache = (k, ttl = 10000) => {
-  const v = cache.get(k);
-  return v && Date.now() - v.ts < ttl ? v.data : null;
-};
-const setCache = (k, data) => cache.set(k, { ts: Date.now(), data });
-
-const BE = "https://public-api.birdeye.so";
-const beHeaders = { "X-API-KEY": BIRDEYE_KEY, accept: "application/json" };
-const WSOL = "So11111111111111111111111111111111111111112";
-const TOKEN_LEGACY = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-const TOKEN_2022 = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
-
-// Jupiter token list for nice names/logos
-let jupMap = new Map();
-async function loadJup() {
-  try {
-    const r = await fetch("https://token.jup.ag/all");
-    const list = await r.json();
-    jupMap = new Map(list.map(t => [t.address, t]));
-    console.log(`Loaded Jupiter list: ${list.length} tokens`);
-  } catch (e) {
-    console.error("Failed to load Jupiter list", e);
-  }
-}
-await loadJup();
-setInterval(loadJup, 24 * 60 * 60 * 1000);
+// ---------- RPC ----------
+const RPC_URL = HELIUS_API_KEY
+  ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
+  : "https://api.mainnet-beta.solana.com";
 
 const conn = new Connection(RPC_URL, "confirmed");
 
-// --------- Birdeye price helpers ----------
-async function beJson(url) {
-  const r = await fetch(url, { headers: beHeaders });
-  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
-  return r.json();
+// ---------- CONSTANTS ----------
+const WSOL = "So11111111111111111111111111111111111111112";
+
+// Basic rate-limit friendly fetch wrapper (Node 18+ has global fetch)
+async function http(url, opt = {}) {
+  const r = await fetch(url, opt);
+  return r;
 }
-async function getPrice(address) {
-  try {
-    const u = new URL(`${BE}/defi/price`);
-    u.searchParams.set("address", address);
-    const j = await beJson(u);
-    const d = j.data;
-    if (typeof d === "number") return d;
-    if (d?.value != null) return Number(d.value) || 0;
-    if (d?.price != null) return Number(d.price) || 0;
-    return 0;
-  } catch {
-    return 0;
+
+// ---------- Jupiter token metadata cache ----------
+let jupMap = null;
+let jupLoadPromise = null;
+
+async function getJupMap() {
+  if (jupMap) return jupMap;
+  if (!jupLoadPromise) {
+    jupLoadPromise = (async () => {
+      try {
+        const r = await http("https://token.jup.ag/all");
+        const list = (await r.json()) || [];
+        const m = new Map();
+        for (const t of list) {
+          m.set(t.address, {
+            symbol: t.symbol || "",
+            name: t.name || "",
+            logoURI: t.logoURI || "",
+          });
+        }
+        return m;
+      } catch (e) {
+        console.warn("[jup] token list failed:", e.message);
+        return new Map();
+      }
+    })();
   }
+  jupMap = await jupLoadPromise;
+  return jupMap;
 }
-async function getPrices(addresses) {
-  const uniq = [...new Set(addresses)];
+
+// ---------- Prices: Jupiter (primary) → Birdeye (fallback) ----------
+async function getPrices(mints) {
+  const uniq = [...new Set((mints || []).filter(Boolean))];
   const out = {};
-  const BATCH = 6;
+  const BATCH = 50;
+
+  async function jup(chunk) {
+    // https://price.jup.ag/v4/price?ids=<comma-separated-mints>
+    const r = await http(`https://price.jup.ag/v4/price?ids=${chunk.join(",")}`);
+    if (!r.ok) throw new Error(`jup ${r.status}`);
+    const j = await r.json();
+    const data = j?.data || {};
+    for (const k of Object.keys(data)) {
+      const px = Number(data[k]?.price);
+      if (Number.isFinite(px)) out[k] = px;
+    }
+  }
+
+  async function birdeye(chunk) {
+    // https://public-api.birdeye.so/defi/multi_price?chain=solana&address=<comma>
+    const r = await http(
+      `https://public-api.birdeye.so/defi/multi_price?chain=solana&address=${chunk.join(",")}`,
+      { headers: { "x-api-key": BIRDEYE_API_KEY } }
+    );
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      console.warn(`[prices] birdeye ${r.status}: ${body?.slice(0, 300)}`);
+      throw new Error(`birdeye ${r.status}`);
+    }
+    const j = await r.json();
+    const data = j?.data || j?.results || {};
+    for (const k of Object.keys(data)) {
+      const v = data[k]?.value ?? data[k]?.price ?? data[k];
+      const px = Number(v);
+      if (Number.isFinite(px) && out[k] == null) out[k] = px; // only fill gaps
+    }
+  }
+
   for (let i = 0; i < uniq.length; i += BATCH) {
     const chunk = uniq.slice(i, i + BATCH);
-    const vals = await Promise.all(chunk.map(a => getPrice(a)));
-    chunk.forEach((a, idx) => (out[a] = vals[idx] || 0));
+
+    // 1) Jupiter public endpoint
+    try {
+      await jup(chunk);
+    } catch (e) {
+      console.warn("[prices] jup chunk failed:", e.message);
+    }
+
+    // 2) Birdeye only if still missing + we have a key
+    const missing = chunk.filter((m) => out[m] == null);
+    if (missing.length && BIRDEYE_API_KEY) {
+      try {
+        await birdeye(missing);
+      } catch (_) {
+        /* already logged */
+      }
+    }
   }
   return out;
 }
 
-// ---------- WALLET ----------
-function shortPk(pk) {
-  try { return new PublicKey(pk).toBase58().slice(0,4) + "…" + new PublicKey(pk).toBase58().slice(-4); }
-  catch { return String(pk).slice(0,4) + "…" + String(pk).slice(-4); }
-}
-
+// ---------- Helpers ----------
 async function safeGetParsed(owner, programId, label) {
   try {
-    const out = await conn.getParsedTokenAccountsByOwner(owner, { programId });
-    return out.value || [];
+    const { value } = await conn.getParsedTokenAccountsByOwner(owner, {
+      programId,
+    });
+    return value || [];
   } catch (e) {
-    console.warn(`[wallet] ${label} token scan failed:`, e?.message || e);
-    return []; // graceful fallback
+    console.warn(`[wallet] getParsed ${label}:`, e.message);
+    return [];
   }
 }
 
+function pick(obj, keys) {
+  const out = {};
+  for (const k of keys) out[k] = obj[k];
+  return out;
+}
+
+// ---------- Express ----------
+const app = express();
+app.use(cors());
+app.use((req, _res, next) => {
+  req.start = Date.now();
+  next();
+});
+app.use((req, res, next) => {
+  res.on("finish", () => {
+    const ms = Date.now() - req.start;
+    console.log(
+      `[${req.method}]${res.statusCode} ${req.originalUrl} ` +
+        `clientIP="${(req.headers["x-forwarded-for"] || "").split(",")[0] || req.ip}" ` +
+        `responseTimeMS=${ms} responseBytes=${res.getHeader("content-length") || 0} ` +
+        `userAgent=${JSON.stringify(req.headers["user-agent"] || "")}`
+    );
+  });
+  next();
+});
+
+// Simple health
+app.get("/", (_req, res) => res.json({ ok: true, rpc: RPC_URL.includes("helius") ? "helius" : "solana" }));
+app.get("/client", (req, res) => res.json({ ip: (req.headers["x-forwarded-for"] || "").split(",")[0] || req.ip }));
+app.get("/clientIP", (req, res) => res.json({ ip: (req.headers["x-forwarded-for"] || "").split(",")[0] || req.ip }));
+
+// ---------- /wallet ----------
 app.get("/wallet", async (req, res) => {
   const ownerStr = String(req.query.address || "").trim();
   const minUsd = Number(req.query.minUsd ?? 0);
   const maxTokens = Math.max(1, Number(req.query.maxTokens ?? 25));
+
   if (!ownerStr) return res.status(400).json({ error: "Missing address" });
 
   try {
-    const cacheKey = `wallet:${ownerStr}:${minUsd}:${maxTokens}`;
-    const cached = getCache(cacheKey, 10000);
-    if (cached) return res.json(cached);
-
     const owner = new PublicKey(ownerStr);
+    const jmap = await getJupMap();
 
-    // SOL balance always safe
+    // SOL balance
     let sol = 0;
     try {
-      const lamports = await conn.getBalance(owner, "confirmed");
-      sol = lamports / LAMPORTS_PER_SOL;
+      sol = (await conn.getBalance(owner, "confirmed")) / LAMPORTS_PER_SOL;
     } catch (e) {
-      console.warn("[wallet] getBalance failed:", e?.message || e);
+      console.warn("[wallet] getBalance:", e.message);
     }
 
-    // Query both token programs, but never crash if one fails
-    const [legacyAccounts, t22Accounts] = await Promise.all([
-      safeGetParsed(owner, TOKEN_LEGACY, "Tokenkeg"),
-      safeGetParsed(owner, TOKEN_2022,  "Token-2022"),
+    // Token accounts (legacy + Token-2022)
+    const [legacy, t22] = await Promise.all([
+      safeGetParsed(owner, TOKEN_PROGRAM_ID, "Tokenkeg"),
+      safeGetParsed(owner, TOKEN_2022_PROGRAM_ID, "Token-2022"),
     ]);
-    const accounts = [...legacyAccounts, ...t22Accounts];
+    const accounts = [...legacy, ...t22];
 
-    const tokensRaw = accounts.map(v => {
-      const info = v.account.data.parsed.info;
-      const mint = info.mint;
-      const ta = info.tokenAmount;
-      return {
-        mint,
-        amount: Number(ta?.uiAmount || 0),
-        decimals: Number(ta?.decimals || 0),
-      };
-    }).filter(t => t.amount > 0);
+    const tokensRaw = accounts
+      .map((acc) => {
+        const info = acc?.account?.data?.parsed?.info;
+        const ta = info?.tokenAmount;
+        return {
+          mint: info?.mint,
+          amount: Number(ta?.uiAmount || 0),
+          decimals: Number(ta?.decimals || 0),
+        };
+      })
+      .filter((t) => t?.mint && t.amount > 0);
 
-    const mints = [...new Set(tokensRaw.map(t => t.mint))];
-
-    // Prices (tokens + WSOL for SOL USD)
+    const mints = [...new Set(tokensRaw.map((t) => t.mint))];
     const priceMap = await getPrices([...mints, WSOL]);
     const solPrice = Number(priceMap[WSOL] || 0);
 
-    const tokens = tokensRaw.map(t => {
-      const meta = jupMap.get(t.mint) || {};
-      const priceUsd = Number(priceMap[t.mint] || 0);
-      const usd = priceUsd * t.amount;
-      const logo = meta.logoURI || `https://img.jup.ag/128/${t.mint}.png`;
-      const symbol = meta.symbol || (meta.name ? meta.name.slice(0, 10) : "");
-      return {
-        mint: t.mint,
-        symbol,
-        name: meta.name || "",
-        logo,
-        amount: t.amount,
-        decimals: t.decimals,
-        priceUsd,
-        usd,
-      };
-    })
-    // show highest value first; if price is 0, keep but push down
-    .sort((a, b) => (b.usd || 0) - (a.usd || 0));
+    const tokens = tokensRaw
+      .map((t) => {
+        const meta = jmap.get(t.mint) || {};
+        const priceUsd = Number(priceMap[t.mint] || 0);
+        const usd = priceUsd * t.amount;
+        const logo = meta.logoURI || `https://img.jup.ag/128/${t.mint}.png`;
+        return {
+          mint: t.mint,
+          symbol: meta.symbol || "",
+          name: meta.name || "",
+          image: logo, // field your UI reads
+          logo,        // kept for back-compat
+          amount: t.amount,
+          decimals: t.decimals,
+          priceUsd,
+          usd,
+        };
+      })
+      .sort((a, b) => (b.usd || 0) - (a.usd || 0));
 
+    // Only apply minUsd if we actually have a price for the token
     const visible = tokens
-      .filter(t => (t.priceUsd > 0 ? t.usd >= minUsd : true))
+      .filter((t) => (t.priceUsd > 0 ? t.usd >= minUsd : true))
       .slice(0, maxTokens);
 
-    const payload = {
+    const totalUsd =
+      (solPrice * sol) +
+      visible.reduce((s, t) => s + (Number.isFinite(t.usd) ? t.usd : 0), 0);
+
+    return res.json({
       owner: ownerStr,
-      ownerShort: shortPk(ownerStr),
       updated: new Date().toISOString(),
       sol,
       solUsd: sol * solPrice,
-      totalUsd: (sol * solPrice) + visible.reduce((s, t) => s + (t.usd || 0), 0),
+      totalUsd,
       tokens: visible,
-    };
-
-    setCache(cacheKey, payload);
-    return res.json(payload);
+      priceProvider: {
+        jupiter: true,
+        birdeye: Boolean(BIRDEYE_API_KEY),
+      },
+    });
   } catch (e) {
-    console.error("[wallet] fatal handler error:", e);
-    // Always return 200 with a minimal payload to avoid a 502 from the platform
+    console.error("[wallet] fatal:", e);
     return res.status(200).json({
       owner: ownerStr,
       updated: new Date().toISOString(),
@@ -197,112 +264,85 @@ app.get("/wallet", async (req, res) => {
   }
 });
 
-// ---------- BUYS ----------
-async function birdeyeTrades(addr) {
-  // try /defi/trades then /defi/txs
-  try {
-    const u = new URL(`${BE}/defi/trades`);
-    u.searchParams.set("address", addr);
-    u.searchParams.set("limit", "200");
-    const j = await beJson(u);
-    return j.data || j.results || [];
-  } catch {}
-  try {
-    const u = new URL(`${BE}/defi/txs`);
-    u.searchParams.set("address", addr);
-    u.searchParams.set("limit", "200");
-    const j = await beJson(u);
-    return j.data || j.results || [];
-  } catch {}
-  return [];
-}
-
-async function birdeyePairsForToken(mint) {
-  try {
-    const u = new URL(`${BE}/defi/markets`);
-    u.searchParams.set("address", mint);
-    const j = await beJson(u);
-    const rows = j.data || j.results || [];
-    // normalize to just pair addresses if present
-    return rows
-      .map(r => r.pairAddress || r.address || r.market || r.pair || "")
-      .filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-// ?type=token|pair&address=...&limit=10&minUsd=0
+// ---------- /buys ----------
 app.get("/buys", async (req, res) => {
+  const type = String(req.query.type || "token"); // "token" | "wallet"
+  const address = String(req.query.address || "").trim();
+  const limit = Math.max(1, Math.min(50, Number(req.query.limit ?? 10)));
+  const minUsd = Number(req.query.minUsd ?? 0);
+
+  if (!address) return res.status(400).json({ error: "Missing address" });
+  if (!BIRDEYE_API_KEY) {
+    // We can’t pull txs without Birdeye; respond gracefully
+    return res.json({ buys: [], warning: "No BIRDEYE_API_KEY set" });
+  }
+
   try {
-    let typ = String(req.query.type ?? req.query.kind ?? "token").toLowerCase();
-    if (typ !== "token" && typ !== "pair") typ = "token";
-    const address = String(req.query.address || "").trim();
-    const limit = Math.min(Number(req.query.limit ?? 10), 100);
-    const minUsd = Number(req.query.minUsd ?? 0);
-    if (!address) return res.status(400).json({ error: "Missing address" });
+    // Birdeye tx endpoints
+    const url =
+      type === "wallet"
+        ? `https://public-api.birdeye.so/defi/txns/address?chain=solana&address=${address}&type=buy&sort=desc&limit=${limit}`
+        : `https://public-api.birdeye.so/defi/txns/token?chain=solana&address=${address}&type=buy&sort=desc&limit=${limit}`;
 
-    const cacheKey = `buys:${typ}:${address}:${limit}:${minUsd}`;
-    const cached = getCache(cacheKey, 10000);
-    if (cached) return res.json(cached);
-
-    let rows = await birdeyeTrades(address);
-
-    // if token and nothing came back, resolve pairs and try those
-    if (typ === "token" && (!rows || rows.length === 0)) {
-      const pairs = await birdeyePairsForToken(address);
-      for (const p of pairs.slice(0, 3)) {
-        const more = await birdeyeTrades(p);
-        rows = rows.concat(more);
-        if (rows.length >= limit) break;
-      }
+    const r = await http(url, { headers: { "x-api-key": BIRDEYE_API_KEY } });
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      console.warn(`[buys] birdeye ${r.status}: ${body?.slice(0, 300)}`);
+      return res.json({ buys: [], warning: `Birdeye ${r.status}` });
     }
+    const j = await r.json();
+    const rows = j?.data?.items || j?.data || j?.items || [];
 
-    const items = (rows || [])
-      .map(x => {
-        const sideStr = [
-          x.side, x.tradeType, x.type, x.action,
-          (x.is_buy === true ? "buy" : ""),
-          (x.isBuyer === true ? "buy" : "")
-        ]
-          .filter(Boolean)
-          .map(s => String(s).toLowerCase())
-          .join(" ");
-        const isBuy = /\bbuy\b/.test(sideStr);
+    // Collect mints for price lookup (to compute USD if missing)
+    const toPrice = new Set();
+    rows.forEach((tx) => {
+      if (tx?.tokenMint) toPrice.add(tx.tokenMint);
+      if (tx?.baseMint) toPrice.add(tx.baseMint);
+      if (tx?.mint) toPrice.add(tx.mint);
+    });
+    const pmap = await getPrices([...toPrice]);
+    const jmap = await getJupMap();
 
-        const usd = Number(
-          x.volume_usd ?? x.usdValue ?? x.value_usd ?? x.totalUsd ?? 0
-        ) || 0;
-        const qty = Number(x.amountToken ?? x.base_amount ?? x.amount ?? x.size ?? 0) || 0;
-        const price = Number(x.priceUsd ?? x.price_usd ?? x.price ?? 0) || 0;
-        const symbol = x.symbol || x.base_symbol || x.baseSymbol || "";
-        const dex = x.dex || x.market || x.source || "";
-        const tx = x.txHash || x.tx_hash || x.signature || "";
-        const tms =
-          Number(x.ts) ||
-          Number(x.blockUnixTime) ||
-          (x.blockTime ? Number(x.blockTime) * 1000 : 0);
+    const buys = rows
+      .map((tx) => {
+        const mint = tx.tokenMint || tx.baseMint || tx.mint || "";
+        const amount =
+          Number(tx?.amount || tx?.tokenAmount || tx?.baseAmount || 0) || 0;
+        const px =
+          Number(tx?.priceUsd) ||
+          Number(pmap[mint] || 0); // prefer provider price if present
+        const usdRaw =
+          Number(tx?.valueUsd) ||
+          (Number.isFinite(px) && px > 0 ? amount * px : undefined);
+
+        const meta = jmap.get(mint) || {};
+        const logo = meta.logoURI || (mint ? `https://img.jup.ag/128/${mint}.png` : "");
+
         return {
-          isBuy, usd, qty, priceUsd: price, symbol, dex, tx,
-          time: tms ? new Date(tms).toISOString() : undefined,
+          sig: tx.signature || tx.txHash || tx.sig || "",
+          ts: tx.blockUnixTime || tx.ts || tx.time || 0,
+          mint,
+          symbol: meta.symbol || "",
+          name: meta.name || "",
+          image: logo,
+          amount,
+          priceUsd: Number.isFinite(px) && px > 0 ? px : undefined,
+          usd: Number.isFinite(usdRaw) ? usdRaw : undefined,
+          owner: tx.owner || tx.trader || tx.user || "",
         };
       })
-      .filter(i => i.isBuy && i.usd >= minUsd)
-      .sort((a, b) => (b.time || "").localeCompare(a.time || ""))
+      // Only enforce minUsd when we actually *have* a USD number
+      .filter((b) => (b.usd == null ? true : b.usd >= minUsd))
       .slice(0, limit);
 
-    const payload = { type: typ, address, items };
-    setCache(cacheKey, payload);
-    res.json(payload);
+    return res.json({ buys });
   } catch (e) {
-    console.error("buys error", e);
-    res.status(500).json({ error: String(e?.message || e) });
+    console.error("[buys] fatal:", e);
+    return res.json({ buys: [], warning: String(e?.message || e) });
   }
 });
 
-// health
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "wallet + buys proxy", time: new Date().toISOString() });
+// ---------- start ----------
+app.listen(PORT, () => {
+  console.log(`Service on :${PORT} → ${RPC_URL}`);
 });
-
-app.listen(PORT, () => console.log(`proxy listening on :${PORT}`));
