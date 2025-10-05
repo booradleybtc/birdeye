@@ -1,15 +1,14 @@
 {
-  "name": "birdeye-proxy",
+  "name": "wallet-and-birdeye-proxy",
+  "version": "1.0.0",
   "private": true,
-  "type": "module",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5"
-  },
-  "engines": {
-    "node": ">=18"
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
   }
 }
