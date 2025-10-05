@@ -1,11 +1,18 @@
 {
-  "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5",
-    "node-fetch": "^3.3.2",
-    "@solana/web3.js": "^1.95.0",
-    "@solana/spl-token": "^0.4.7"
+  "name": "solana-birdeye-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": { "node": ">=18.17" },
+  "scripts": {
+    "start": "node index.js"
   },
-  "type": "module",
-  "scripts": { "start": "node index.js" }
+  "dependencies": {
+    "@solana/spl-token": "^0.4.6",
+    "@solana/spl-token-2022": "^0.3.9",
+    "@solana/web3.js": "^1.95.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
+  }
 }
