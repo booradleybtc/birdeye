@@ -1,313 +1,161 @@
-// index.js
-/* eslint-disable no-console */
-const express = require("express");
-const cors = require("cors");
-const crypto = require("crypto");
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 
-// ----------- CONFIG -----------
 const PORT = process.env.PORT || 10000;
-const RPC_URL =
-  process.env.RPC_URL ||
-  "https://api.mainnet-beta.solana.com"; // Prefer your Helius RPC here
-const BIRDEYE_KEY = process.env.BIRDEYE_API_KEY;
-const ALLOWED = (process.env.ALLOWED_ORIGINS || "*")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+const RPC_URL = process.env.RPC_URL;
+const BIRDEYE_KEY = process.env.BIRDEYE_KEY;
 
-if (!BIRDEYE_KEY) {
-  console.warn("⚠️ Missing BIRDEYE_API_KEY env var.");
-}
+if (!RPC_URL) throw new Error("Missing RPC_URL");
+if (!BIRDEYE_KEY) throw new Error("Missing BIRDEYE_KEY");
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(cors());
+app.get("/", (_req, res) => res.json({ ok: true, service: "wallet + buys proxy", time: new Date().toISOString() }));
 
-// CORS
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin || ALLOWED.includes("*") || ALLOWED.includes(origin)) {
-        return cb(null, true);
-      }
-      return cb(new Error("Not allowed by CORS"), false);
-    },
-    credentials: false,
-  })
-);
+/* ------------------------- tiny cache to dodge 429s ------------------------ */
+const cache = new Map(); // key -> { until, data }
+const getCache = (k) => {
+  const v = cache.get(k);
+  return v && v.until > Date.now() ? v.data : null;
+};
+const setCache = (k, data, ms = 8000) => cache.set(k, { until: Date.now() + ms, data });
 
-// ----------- HELPERS -----------
+/* ---------------------------- Birdeye helper ------------------------------- */
+const BIRDEYE_BASE = "https://public-api.birdeye.so";
+const birdHeaders = { "X-API-KEY": BIRDEYE_KEY, "x-chain": "solana" };
 
-// super tiny TTL cache in memory
-const cache = new Map();
-function setCache(key, value, ttlMs = 60_000) {
-  cache.set(key, { value, exp: Date.now() + ttlMs });
-}
-function getCache(key) {
-  const hit = cache.get(key);
-  if (!hit) return null;
-  if (Date.now() > hit.exp) {
-    cache.delete(key);
-    return null;
+async function bird(pathAndQuery, cacheMs = 6000) {
+  const url = `${BIRDEYE_BASE}${pathAndQuery}`;
+  const hit = getCache(url);
+  if (hit) return hit;
+  const r = await fetch(url, { headers: birdHeaders });
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`Birdeye ${pathAndQuery} failed: ${r.status} ${text}`);
   }
-  return hit.value;
+  const json = await r.json();
+  setCache(url, json, cacheMs);
+  return json;
 }
 
-async function rpc(method, params) {
-  const body = { jsonrpc: "2.0", id: crypto.randomUUID(), method, params };
-  const res = await fetch(RPC_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`RPC ${method} failed: ${res.status} ${txt}`);
-  }
-  const json = await res.json();
-  if (json.error) throw new Error(`RPC error: ${json.error.message}`);
-  return json.result;
-}
-
-const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnB7yVqjvG9S7";
-const SOL_MINT = "So11111111111111111111111111111111111111112"; // for pricing
-
-async function getTokenAccountsByOwner(owner, programId) {
-  return rpc("getTokenAccountsByOwner", [
-    owner,
-    { programId },
-    { encoding: "jsonParsed", commitment: "confirmed" },
-  ]);
-}
-
-async function getSolBalance(owner) {
-  const r = await rpc("getBalance", [owner, { commitment: "confirmed" }]);
-  return (r?.value ?? 0) / 1e9; // lamports -> SOL
-}
-
-async function birdeye(path, params = {}) {
-  const url = new URL(`https://public-api.birdeye.so${path}`);
-  Object.entries(params).forEach(([k, v]) => {
-    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-  });
-  const key = `be:${url.toString()}`;
-  const cached = getCache(key);
-  if (cached) return cached;
-
-  // simple retry/backoff for 429
-  let lastErr;
-  for (let i = 0; i < 3; i++) {
-    const res = await fetch(url, {
-      headers: {
-        accept: "application/json",
-        "x-chain": "solana",
-        "X-API-KEY": BIRDEYE_KEY || "",
-      },
-    });
-    if (res.status === 429) {
-      await new Promise(r => setTimeout(r, 300 * (i + 1)));
-      lastErr = new Error("Birdeye rate limited");
-      continue;
-    }
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(
-        `Birdeye ${path} failed: ${res.status} ${txt || res.statusText}`
-      );
-    }
-    const json = await res.json();
-    setCache(key, json, 30_000);
-    return json;
-  }
-  throw lastErr || new Error("Birdeye request failed");
-}
-
-// fetch price for a single mint (kept simple & robust)
-async function getPriceUSD(mint) {
-  if (!mint) return null;
-  const key = `price:${mint}`;
-  const cached = getCache(key);
-  if (cached !== null) return cached;
-
-  // Birdeye single-price endpoint
-  // docs typically: /defi/price?address=<mint>
-  const data = await birdeye("/defi/price", { address: mint });
-  const price = data?.data?.value ?? data?.data?.price ?? null;
-  setCache(key, price, 45_000);
-  return price;
-}
-
-// ----------- ROUTES -----------
-
-// health
-app.get("/", (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: "wallet + buys proxy",
-    time: new Date().toISOString(),
-  });
-});
-
-// 1) Wallet snapshot (balances + USD)
-app.get("/wallet", async (req, res) => {
+/* ------------------------------ /birdeye passthrough ----------------------- */
+/* Supports:
+   type=markets -> /defi/markets?address=<mint or pair>
+   type=token_txs -> /defi/v3/token/txs?address=<mint>&limit=...
+   type=pair_txs  -> /defi/v3/pair/txs?address=<pair>&limit=...
+   type=price     -> /defi/price?address=<mint>
+*/
+app.get("/birdeye", async (req, res) => {
   try {
-    const owner = String(req.query.address || "").trim();
-    const minUsd = Number(req.query.minUsd ?? 0); // filter dust
-    const maxTokens = Math.min(Number(req.query.maxTokens ?? 50), 200);
+    const { type, address, limit = 50 } = req.query;
+    if (!type || !address) return res.status(400).json({ error: "type and address are required" });
 
-    if (!owner) return res.status(400).json({ error: "address required" });
+    let path = null;
+    if (type === "markets") path = `/defi/markets?address=${address}`;
+    else if (type === "token_txs") path = `/defi/v3/token/txs?address=${address}&limit=${limit}`;
+    else if (type === "pair_txs") path = `/defi/v3/pair/txs?address=${address}&limit=${limit}`;
+    else if (type === "price") path = `/defi/price?address=${address}`;
+    else return res.status(400).json({ error: "unsupported type" });
 
-    // gather SPL balances from both token programs
-    const [classic, t22] = await Promise.all([
-      getTokenAccountsByOwner(owner, TOKEN_PROGRAM),
-      getTokenAccountsByOwner(owner, TOKEN_2022),
-    ]);
-
-    const rows = []
-      .concat(classic?.value || [], t22?.value || [])
-      .map((it) => it?.account?.data?.parsed?.info)
-      .filter(Boolean);
-
-    // aggregate by mint
-    const mapByMint = new Map();
-    for (const r of rows) {
-      const mint = r?.mint;
-      const ta = r?.tokenAmount;
-      if (!mint || !ta) continue;
-      const ui = Number(ta.uiAmountString ?? ta.uiAmount ?? 0);
-      if (!mapByMint.has(mint)) {
-        mapByMint.set(mint, {
-          mint,
-          amount: 0,
-          decimals: ta.decimals ?? 0,
-        });
-      }
-      const agg = mapByMint.get(mint);
-      agg.amount += ui;
-      // keep max decimals seen
-      agg.decimals = Math.max(agg.decimals, ta.decimals ?? 0);
-    }
-
-    // include SOL
-    let solAmount = 0;
-    try {
-      solAmount = await getSolBalance(owner);
-      if (solAmount > 0) {
-        mapByMint.set(SOL_MINT, { mint: SOL_MINT, amount: solAmount, decimals: 9 });
-      }
-    } catch (_) {}
-
-    // turn into array, cap tokens to price (top balances first)
-    let items = Array.from(mapByMint.values()).sort(
-      (a, b) => b.amount - a.amount
-    );
-    items = items.slice(0, maxTokens);
-
-    // price each mint (sequential but cached; keeps under Birdeye limits)
-    let totalUsd = 0;
-    for (const it of items) {
-      const price = await getPriceUSD(it.mint);
-      const usd = price ? price * it.amount : null;
-      it.price = price;
-      it.usd = usd;
-      if (usd) totalUsd += usd;
-    }
-
-    // optional dust filter
-    if (minUsd > 0) {
-      items = items.filter((it) => (it.usd || 0) >= minUsd);
-    }
-
-    res.json({
-      address: owner,
-      count: items.length,
-      totalUsd,
-      tokens: items.sort((a, b) => (b.usd || 0) - (a.usd || 0)),
-      updatedAt: new Date().toISOString(),
-    });
+    const data = await bird(path);
+    res.json(data);
   } catch (e) {
-    console.error("wallet error:", e);
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// 2) Last 10 buys (Birdeye)
+/* ----------------------------- /buys (filtered) ---------------------------- */
+/* kind=token|pair, address=<mint or pair>, limit=50 */
 app.get("/buys", async (req, res) => {
   try {
-    const type = (req.query.type || "token").toString(); // token | pair
-    const address = (req.query.address || "").toString();
-    const limit = Math.min(Number(req.query.limit || 10), 100);
+    const { kind = "token", address, limit = 50 } = req.query;
+    if (!address) return res.status(400).json({ error: "address is required" });
+    const path =
+      kind === "pair"
+        ? `/defi/v3/pair/txs?address=${address}&limit=${limit}`
+        : `/defi/v3/token/txs?address=${address}&limit=${limit}`;
 
-    if (!address) return res.status(400).json({ error: "address required" });
-    if (!["token", "pair"].includes(type))
-      return res.status(400).json({ error: "invalid type" });
+    const raw = await bird(path);
+    const items = (raw?.data?.items || raw?.data || raw?.items || [])
+      .filter((t) => {
+        // Birdeye objects vary slightly by endpoint/version; normalize:
+        const side = (t.side || t.type || t.tx_type || "").toString().toLowerCase();
+        const isBuy = t.is_buy === true || side === "buy";
+        // Some payloads use `amount_usd` / `value_usd`, keep both
+        t.usd = t.amount_usd ?? t.value_usd ?? t.usd ?? null;
+        t.qty = t.amount ?? t.qty ?? t.base_amount ?? null;
+        return isBuy;
+      })
+      .slice(0, Number(limit));
 
-    const data = await birdeye("/defi/trades", {
-      address,
-      type,
-      offset: 0,
-      limit,
-      sort_type: "desc",
-    });
-
-    // normalize: keep only buys
-    const rows = (data?.data?.items || []).filter(
-      (t) => (t?.side || "").toLowerCase() === "buy"
-    );
-
-    const out = rows.map((t) => ({
-      tx: t?.txHash || t?.txHashAll || t?.tx || "",
-      time: t?.blockUnixTime || t?.blockTime || null,
-      price: t?.price || t?.priceUsd || null,
-      amountToken: t?.baseAmount ?? t?.amount ?? null,
-      amountQuote: t?.quoteAmount ?? null,
-      maker: t?.maker || null,
-      taker: t?.taker || null,
-      market: t?.marketId || t?.pairAddress || null,
-      dex: t?.dex || t?.dexName || null,
-    }));
-
-    res.json({ type, address, count: out.length, items: out });
+    res.json({ items, srcCount: items.length });
   } catch (e) {
-    const msg = String(e.message || e);
-    const is429 = /rate limited|429/.test(msg);
-    console.error("buys error:", msg);
-    res.status(is429 ? 429 : 500).json({ error: msg });
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// 3) Your original passthrough (kept for compatibility)
-app.get("/birdeye", async (req, res) => {
+/* ---------------------------- /wallet (snapshot) --------------------------- */
+/* Returns non-zero token balances across both programs + Birdeye USD */
+const conn = new Connection(RPC_URL, "confirmed");
+
+async function getTokenAccounts(owner, programId) {
+  const resp = await conn.getParsedTokenAccountsByOwner(owner, { programId });
+  return resp.value
+    .map(({ pubkey, account }) => {
+      try {
+        const info = account.data.parsed.info;
+        const amt = info.tokenAmount;
+        return {
+          account: pubkey.toBase58(),
+          mint: info.mint,
+          decimals: Number(amt.decimals),
+          uiAmount: Number(amt.uiAmountString ?? amt.uiAmount ?? 0),
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .filter((t) => t.uiAmount > 0);
+}
+
+async function priceUsd(mint) {
   try {
-    const type = String(req.query.type || "token");
-    const address = String(req.query.address || "");
-    const limit = Math.min(Number(req.query.limit || 100), 500);
+    const p = await bird(`/defi/price?address=${mint}`, 15000);
+    return p?.data?.value ?? p?.data?.price ?? null;
+  } catch {
+    return null;
+  }
+}
 
+app.get("/wallet", async (req, res) => {
+  try {
+    const { address, max = 40 } = req.query;
     if (!address) return res.status(400).json({ error: "address required" });
-    if (!["token", "pair", "markets"].includes(type))
-      return res.status(400).json({ error: "invalid type" });
+    const owner = new PublicKey(address.toString());
 
-    if (type === "markets") {
-      const data = await birdeye("/defi/markets", { address, chain: "solana" });
-      return res.json(data);
+    const [v0, v22] = await Promise.all([
+      getTokenAccounts(owner, TOKEN_PROGRAM_ID),
+      getTokenAccounts(owner, TOKEN_2022_PROGRAM_ID),
+    ]);
+    const balances = [...v0, ...v22].slice(0, Number(max));
+
+    // Fetch prices with tiny concurrency to avoid 429s
+    const out = [];
+    for (const t of balances) {
+      const usd = await priceUsd(t.mint);
+      out.push({ ...t, priceUsd: usd, valueUsd: usd ? usd * t.uiAmount : null });
+      await new Promise((r) => setTimeout(r, 120)); // throttle a bit
     }
 
-    const data = await birdeye("/defi/trades", {
-      type,
-      address,
-      limit,
-      offset: 0,
-      sort_type: "desc",
-    });
-    res.json(data);
+    res.json({ address, count: out.length, tokens: out });
   } catch (e) {
-    const msg = String(e.message || e);
-    const is429 = /rate limited|429/.test(msg);
-    console.error("proxy error:", msg);
-    res.status(is429 ? 429 : 500).json({ error: msg });
+    res.status(500).json({ error: `RPC error: ${String(e.message || e)}` });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Wallet + Birdeye proxy listening on :${PORT}`);
-});
+/* -------------------------------------------------------------------------- */
+app.listen(PORT, () => console.log(`proxy listening on :${PORT}`));
